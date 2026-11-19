@@ -635,6 +635,22 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                         "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
 
+        # =========================================================================
+        # github Actions patch (Chunk分割)
+        # =========================================================================
+        chunk_index = int(os.environ.get("BUILD_CHUNK_INDEX", "-1"))
+        num_chunks = int(os.environ.get("BUILD_NUM_CHUNKS", "20"))
+
+        target_sources = renamed_sources
+        if chunk_index >= 0 and num_chunks > 0:
+            # Round-Robinでビルド対象のソースを絞り込む
+            target_sources = [
+                renamed_sources[i] for i in range(len(renamed_sources)) if i % num_chunks == chunk_index
+            ]
+            print(f"\n[Parallel Build] Building Chunk {chunk_index + 1}/{num_chunks} (Round-Robin)")
+            print(f"[Parallel Build] Compiling {len(target_sources)} files out of {len(renamed_sources)}\n")
+        # =========================================================================
+
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
         if hip_version > Version('5.5.00000'):
@@ -663,7 +679,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         ext_modules.append(
             CUDAExtension(
                 name="flash_attn_2_cuda",
-                sources=renamed_sources,
+                sources=target_sources,  # renamed_sources から target_sources に変更
                 extra_compile_args=extra_compile_args,
                 include_dirs=include_dirs,
             )
@@ -754,32 +770,59 @@ class CachedWheelsCommand(_bdist_wheel):
 
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
-        # do not override env MAX_JOBS if already exists
-        if not os.environ.get("MAX_JOBS"):
-            import psutil
-
-            nvcc_threads = max(1, int(NVCC_THREADS))
-
-            # calculate the maximum allowed NUM_JOBS based on cores
-            max_num_jobs_cores = max(1, os.cpu_count() // 2)
-
-            # calculate the maximum allowed NUM_JOBS based on free memory
-            free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
-            # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
-            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
-            max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
-
-            # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-            print(
-                f"Auto set MAX_JOBS to `{max_jobs}`, NVCC_THREADS to `{nvcc_threads}`. "
-                "If you see memory pressure, please use a lower `MAX_JOBS=N` or `NVCC_THREADS=N` value."
-            )
-            os.environ["MAX_JOBS"] = str(max_jobs)
-
+        # (中略)
         super().__init__(*args, **kwargs)
 
     def build_extensions(self) -> None:
+        # =========================================================================
+        # github Action patch (Compile Only / Link Only)
+        # =========================================================================
+        if os.environ.get("BUILD_COMPILE_ONLY", "0") == "1":
+            print("[Parallel Build] Skipping link phase because BUILD_COMPILE_ONLY=1")
+            self.compiler.link = lambda *args, **kwargs: None
+
+        if os.environ.get("BUILD_LINK_ONLY", "0") == "1":
+            print("[Parallel Build] Skipping compile phase because BUILD_LINK_ONLY=1")
+            import subprocess
+            
+            if not hasattr(subprocess, "_original_run"):
+                subprocess._original_run = subprocess.run
+                subprocess._original_check_call = subprocess.check_call
+                subprocess._original_check_output = subprocess.check_output
+
+            def is_ninja_cmd(cmd):
+                if isinstance(cmd, (list, tuple)) and len(cmd) > 0:
+                    return "ninja" in str(cmd[0]).lower()
+                elif isinstance(cmd, str):
+                    return "ninja" in cmd.lower()
+                return False
+
+            def mocked_run(*args, **kwargs):
+                cmd = args[0] if args else kwargs.get("args", [])
+                if is_ninja_cmd(cmd):
+                    print(f"[Parallel Build] Mocking ninja run: {cmd}")
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+                return subprocess._original_run(*args, **kwargs)
+
+            def mocked_check_call(*args, **kwargs):
+                cmd = args[0] if args else kwargs.get("args", [])
+                if is_ninja_cmd(cmd):
+                    print(f"[Parallel Build] Mocking ninja check_call: {cmd}")
+                    return 0
+                return subprocess._original_check_call(*args, **kwargs)
+
+            def mocked_check_output(*args, **kwargs):
+                cmd = args[0] if args else kwargs.get("args", [])
+                if is_ninja_cmd(cmd):
+                    print(f"[Parallel Build] Mocking ninja check_output: {cmd}")
+                    return b""
+                return subprocess._original_check_output(*args, **kwargs)
+
+            subprocess.run = mocked_run
+            subprocess.check_call = mocked_check_call
+            subprocess.check_output = mocked_check_output
+        # =========================================================================
+
         original_spawn = None
         if sys.platform == "win32" and self.compiler.compiler_type == "msvc":
             original_spawn = self.compiler.spawn
